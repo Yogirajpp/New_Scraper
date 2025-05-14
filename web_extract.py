@@ -10,6 +10,8 @@ import logging
 from urllib.parse import urlparse
 import json
 import time
+import cachetools
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -19,15 +21,25 @@ class WebExtractor:
     def __init__(
         self, 
         include_images: bool = False, 
-        timeout: int = 30,
+        timeout: int = 15,
         max_text_length: int = 10000,
         min_content_length: int = 100,  # Minimum content length to consider valid
-        pytesseract_path: Optional[str] = None
+        pytesseract_path: Optional[str] = None,
+        thread_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None,
+        cache_size: int = 100,  # Cache size for results
+        connection_pool_size: int = 20  # Connection pool size for HTTP requests
     ):
         self.include_images = include_images
         self.timeout = timeout
         self.max_text_length = max_text_length
         self.min_content_length = min_content_length
+        self.connection_pool_size = connection_pool_size
+        
+        # Use provided thread pool or create a new one
+        self.thread_pool = thread_pool or concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        
+        # Set up a cache for results to avoid redundant requests
+        self.cache = cachetools.LRUCache(maxsize=cache_size)
         
         # Configure pytesseract path if provided
         if pytesseract_path:
@@ -35,7 +47,14 @@ class WebExtractor:
     
     async def extract_information(self, url: str, title: str = "", snippet: str = "") -> Dict[str, Any]:
         """Extract detailed information from a URL"""
+        # Check cache first
+        cache_key = f"extract:{url}"
+        if cache_key in self.cache:
+            logger.info(f"Cache hit for URL: {url}")
+            return self.cache[cache_key]
+        
         logger.info(f"Extracting information from: {url}")
+        start_time = time.time()
         
         result = {
             "url": url,
@@ -51,72 +70,147 @@ class WebExtractor:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                response = await client.get(url)
+            # Set up limits for the HTTP client
+            limits = httpx.Limits(max_connections=self.connection_pool_size)
+            
+            async with httpx.AsyncClient(
+                timeout=self.timeout, 
+                follow_redirects=True,
+                limits=limits
+            ) as client:
+                # Fetch the page with timeout
+                response = await client.get(url, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                })
                 response.raise_for_status()
                 
                 # Check content type
                 content_type = response.headers.get("content-type", "")
                 
                 if "text/html" in content_type:
-                    # Process HTML content
-                    soup = BeautifulSoup(response.text, "html.parser")
+                    # Process HTML content in the thread pool for CPU-bound operations
+                    loop = asyncio.get_event_loop()
+                    
+                    # Parse HTML
+                    html_content = response.text
+                    soup = await loop.run_in_executor(
+                        self.thread_pool,
+                        lambda: BeautifulSoup(html_content, "html.parser")
+                    )
                     
                     # Extract or update title if not provided
                     if not title and soup.title:
                         result["title"] = soup.title.string.strip() if soup.title.string else ""
                     
-                    # Extract metadata
-                    result["metadata"] = self._extract_metadata(soup)
+                    # Extract metadata (light operation)
+                    result["metadata"] = await loop.run_in_executor(
+                        self.thread_pool,
+                        lambda: self._extract_metadata(soup)
+                    )
                     
-                    # Extract main content
-                    result["content"] = self._extract_main_content(soup)
+                    # Extract main content (CPU intensive)
+                    result["content"] = await loop.run_in_executor(
+                        self.thread_pool,
+                        lambda: self._extract_main_content(soup)
+                    )
                     
                     # Check if content is valid
                     if result["content"] and len(result["content"].strip()) >= self.min_content_length:
                         result["has_valid_content"] = True
                     
-                    # If content is not valid, try harder to find content
+                    # If content is not valid, try harder to find content with a different method
                     if not result["has_valid_content"]:
-                        result["content"] = self._extract_fallback_content(soup)
+                        result["content"] = await loop.run_in_executor(
+                            self.thread_pool,
+                            lambda: self._extract_fallback_content(soup)
+                        )
                         if result["content"] and len(result["content"].strip()) >= self.min_content_length:
                             result["has_valid_content"] = True
                     
-                    # Only continue processing if we have valid content
+                    # Only continue processing if we have valid content to save time
                     if result["has_valid_content"]:
-                        # Extract tables if any
-                        result["tables"] = self._extract_tables(soup)
+                        # Process tables and key points in parallel
+                        tables_task = loop.run_in_executor(
+                            self.thread_pool,
+                            lambda: self._extract_tables(soup)
+                        )
                         
-                        # Extract images if requested
+                        key_points_task = loop.run_in_executor(
+                            self.thread_pool,
+                            lambda: self._generate_key_points(result["content"])
+                        )
+                        
+                        # Extract images if requested - do this in parallel
+                        images_task = None
                         if self.include_images:
-                            result["images"] = await self._extract_images(soup, url, client)
+                            images_task = self._extract_images(soup, url, client)
                         
-                        # Generate key points
-                        result["key_points"] = self._generate_key_points(result["content"])
+                        # Wait for all tasks to complete
+                        result["tables"] = await tables_task
+                        result["key_points"] = await key_points_task
+                        
+                        if images_task:
+                            result["images"] = await images_task
+                    
+                    # Add extraction time for performance monitoring
+                    result["extraction_time"] = time.time() - start_time
                     
                 elif "application/json" in content_type:
-                    # Process JSON content
+                    # Process JSON content in thread pool
+                    loop = asyncio.get_event_loop()
+                    
                     json_data = response.json()
-                    result["content"] = json.dumps(json_data, indent=2)
-                    result["key_points"] = self._summarize_json(json_data)
+                    content_task = loop.run_in_executor(
+                        self.thread_pool,
+                        lambda: json.dumps(json_data, indent=2)
+                    )
+                    
+                    key_points_task = loop.run_in_executor(
+                        self.thread_pool,
+                        lambda: self._summarize_json(json_data)
+                    )
+                    
+                    # Get results
+                    result["content"] = await content_task
+                    result["key_points"] = await key_points_task
                     result["has_valid_content"] = True
                     
                 elif "image/" in content_type and self.include_images:
                     # Process image content
                     image_data = response.content
+                    
+                    # Use thread pool for OCR (CPU-intensive)
+                    loop = asyncio.get_event_loop()
+                    img_text = await loop.run_in_executor(
+                        self.thread_pool,
+                        lambda: self._process_image_sync(image_data)
+                    )
+                    
                     result["images"] = [{
                         "src": url,
                         "alt": "Direct image",
-                        "text": await self._extract_text_from_image(image_data)
+                        "text": img_text
                     }]
                     result["has_valid_content"] = True
                 
                 elif "text/" in content_type:
                     # Process plain text content
-                    result["content"] = response.text[:self.max_text_length]
-                    if result["content"] and len(result["content"].strip()) >= self.min_content_length:
+                    text_content = response.text[:self.max_text_length]
+                    result["content"] = text_content
+                    
+                    if text_content and len(text_content.strip()) >= self.min_content_length:
                         result["has_valid_content"] = True
-                        result["key_points"] = self._generate_key_points(result["content"])
+                        
+                        # Generate key points in thread pool
+                        loop = asyncio.get_event_loop()
+                        result["key_points"] = await loop.run_in_executor(
+                            self.thread_pool,
+                            lambda: self._generate_key_points(text_content)
+                        )
+                
+                # Cache the result if it's valid
+                if result["has_valid_content"]:
+                    self.cache[cache_key] = result
                 
                 return result
                 
@@ -129,94 +223,89 @@ class WebExtractor:
         """Extract metadata from HTML"""
         metadata = {}
         
-        # Extract meta tags
+        # Extract meta tags (limit to important ones)
+        meta_tags = ["description", "keywords", "author", "og:title", "og:description", "og:image", "twitter:title", "twitter:description"]
+        
         for meta in soup.find_all("meta"):
             name = meta.get("name") or meta.get("property")
             content = meta.get("content")
-            if name and content:
+            if name and content and (name in meta_tags or name.startswith("og:") or name.startswith("twitter:")):
                 metadata[name] = content
         
-        # Extract schema.org structured data
-        for script in soup.find_all("script", {"type": "application/ld+json"}):
+        # Extract schema.org structured data (only first one to save time)
+        structured_data_found = False
+        for script in soup.find_all("script", {"type": "application/ld+json"}, limit=1):
             try:
-                if script.string:
+                if script.string and not structured_data_found:
                     json_data = json.loads(script.string)
                     metadata["structured_data"] = json_data
+                    structured_data_found = True
             except Exception as e:
                 logger.error(f"Error parsing structured data: {e}")
         
         return metadata
     
     def _extract_main_content(self, soup: BeautifulSoup) -> str:
-        """Extract the main content from HTML"""
-        # Remove script and style elements
-        for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        """Extract the main content from HTML using optimized selectors"""
+        # Create a copy of the soup to manipulate for better performance
+        content_soup = BeautifulSoup(str(soup), "html.parser")
+        
+        # Remove script and style elements (limit for speed)
+        for script in content_soup(["script", "style", "nav", "footer", "header", "aside"], limit=50):
             script.decompose()
         
-        # Try to find main content in common containers
+        # Try to find main content in common containers - short list for speed
         content_selectors = [
-            "article", "main", ".content", "#content", ".post", ".article", 
-            ".entry-content", "#main-content", ".main-content"
+            "article", "main", ".content", "#content", ".post", ".article"
         ]
         
         for selector in content_selectors:
-            content_elem = soup.select_one(selector)
+            content_elem = content_soup.select_one(selector)
             if content_elem:
                 return content_elem.get_text(separator=" ", strip=True)[:self.max_text_length]
         
-        # If no content found, use the body text
-        if soup.body:
-            return soup.body.get_text(separator=" ", strip=True)[:self.max_text_length]
+        # If no content found in common containers, use body text (limit size)
+        if content_soup.body:
+            return content_soup.body.get_text(separator=" ", strip=True)[:self.max_text_length]
         
         return ""
     
     def _extract_fallback_content(self, soup: BeautifulSoup) -> str:
-        """Try harder to extract content when main methods fail"""
-        # Create a copy of the soup to manipulate
-        content_soup = BeautifulSoup(str(soup), "html.parser")
+        """Try harder to extract content when main methods fail - optimized version"""
+        # Look for elements with significant text content (limit to 20 biggest divs)
+        divs = soup.find_all("div", limit=20)
+        best_div = None
+        most_text = 0
         
-        # Remove clearly non-content elements
-        for element in content_soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "form"]):
-            element.decompose()
+        for div in divs:
+            text = div.get_text(strip=True)
+            if len(text) > most_text:
+                most_text = len(text)
+                best_div = div
         
-        # Look for elements with significant text content
-        candidates = []
+        if best_div and most_text >= self.min_content_length:
+            return best_div.get_text(separator=" ", strip=True)[:self.max_text_length]
         
-        for elem in content_soup.find_all(["div", "section", "p"]):
-            text = elem.get_text(strip=True)
-            if len(text) > self.min_content_length:
-                # Calculate text density (text length / HTML length)
-                text_density = len(text) / (len(str(elem)) + 1)  # +1 to avoid division by zero
-                candidates.append((elem, len(text), text_density))
-        
-        # Sort candidates by text length and density
-        candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        
-        # Get the best candidate
-        if candidates:
-            best_elem = candidates[0][0]
-            return best_elem.get_text(separator=" ", strip=True)[:self.max_text_length]
-        
-        # If still no content, try getting all paragraph text
-        paragraphs = content_soup.find_all("p")
+        # If still no content, get all paragraph text
+        paragraphs = soup.find_all("p", limit=20)
         if paragraphs:
-            texts = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20]
-            if texts:
-                return " ".join(texts)[:self.max_text_length]
+            text = " ".join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20)
+            return text[:self.max_text_length]
         
         return ""
     
     def _extract_tables(self, soup: BeautifulSoup) -> List[List[List[str]]]:
-        """Extract tables from HTML"""
+        """Extract tables from HTML - optimized to process fewer tables"""
         tables = []
         
-        for table in soup.find_all("table"):
+        # Limit to 5 tables for performance
+        for table in soup.find_all("table", limit=5):
             table_data = []
-            rows = table.find_all("tr")
+            rows = table.find_all("tr", limit=20)  # Limit to 20 rows
             
             for row in rows:
                 row_data = []
-                cells = row.find_all(["td", "th"])
+                cells = row.find_all(["td", "th"], limit=10)  # Limit to 10 columns
                 
                 for cell in cells:
                     row_data.append(cell.get_text(strip=True))
@@ -230,11 +319,17 @@ class WebExtractor:
         return tables
     
     async def _extract_images(self, soup: BeautifulSoup, base_url: str, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-        """Extract images and their text content"""
+        """Extract images and their text content with improved efficiency"""
         images = []
         seen_urls = set()
         
-        for img in soup.find_all("img"):
+        # Only process the first 5 images for performance
+        img_tags = soup.find_all("img", limit=5)
+        
+        # Create tasks for parallel image processing
+        tasks = []
+        
+        for img in img_tags:
             src = img.get("src", "")
             alt = img.get("alt", "")
             
@@ -251,88 +346,129 @@ class WebExtractor:
             
             seen_urls.add(src)
             
-            try:
-                # Download image
-                img_response = await client.get(src)
-                img_response.raise_for_status()
-                
-                # Process image only if it's an actual image
-                content_type = img_response.headers.get("content-type", "")
-                if "image/" in content_type:
-                    image_data = img_response.content
-                    
-                    # Extract text using OCR if the image is large enough
-                    img_text = ""
-                    try:
-                        image = Image.open(io.BytesIO(image_data))
-                        width, height = image.size
-                        
-                        # Only process images that are reasonably large
-                        if width > 100 and height > 100:
-                            img_text = await self._extract_text_from_image(image_data)
-                    except Exception as e:
-                        logger.error(f"Error processing image: {e}")
-                    
-                    images.append({
-                        "src": src,
-                        "alt": alt,
-                        "text": img_text
-                    })
-                    
-                    # Limit to 5 images to avoid long processing times
-                    if len(images) >= 5:
-                        break
-            
-            except Exception as e:
-                logger.error(f"Error fetching image {src}: {e}")
+            # Create task for this image
+            tasks.append(self._process_image(client, src, alt))
+        
+        # Process all images in parallel
+        image_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Filter valid results
+        for result in image_results:
+            if isinstance(result, Exception):
+                continue
+            if result:  # Skip None results
+                images.append(result)
         
         return images
     
-    async def _extract_text_from_image(self, image_data: bytes) -> str:
-        """Extract text from image using OCR"""
+    async def _process_image(self, client: httpx.AsyncClient, src: str, alt: str) -> Optional[Dict[str, Any]]:
+        """Process a single image"""
         try:
-            # Run OCR in a thread pool to avoid blocking
+            # Check cache
+            cache_key = f"image:{src}"
+            if cache_key in self.cache:
+                return self.cache[cache_key]
+            
+            # Download image with timeout
+            try:
+                img_response = await client.get(src, timeout=5)  # Shorter timeout for images
+                img_response.raise_for_status()
+            except Exception as e:
+                logger.error(f"Error fetching image {src}: {e}")
+                return None
+            
+            # Process image only if it's an actual image
+            content_type = img_response.headers.get("content-type", "")
+            if "image/" not in content_type:
+                return None
+            
+            image_data = img_response.content
+            
+            # Extract text using OCR if the image is large enough
+            img_text = ""
+            try:
+                loop = asyncio.get_event_loop()
+                
+                # First check the image size
+                image_size = await loop.run_in_executor(
+                    self.thread_pool,
+                    lambda: self._check_image_size(image_data)
+                )
+                
+                width, height = image_size
+                
+                # Only process images that are reasonably large and not too large (to avoid memory issues)
+                if width > 100 and height > 100 and width * height < 4000000:  # Limit to 4MP
+                    img_text = await loop.run_in_executor(
+                        self.thread_pool,
+                        lambda: self._process_image_sync(image_data)
+                    )
+            except Exception as e:
+                logger.error(f"Error processing image: {e}")
+            
+            result = {
+                "src": src,
+                "alt": alt,
+                "text": img_text
+            }
+            
+            # Cache the result
+            self.cache[cache_key] = result
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"Error processing image {src}: {e}")
+            return None
+    
+    def _check_image_size(self, image_data: bytes) -> Tuple[int, int]:
+        """Check the dimensions of an image"""
+        try:
             image = Image.open(io.BytesIO(image_data))
-            
-            # Run in thread pool executor
-            loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(
-                None, lambda: pytesseract.image_to_string(image)
-            )
-            
+            return image.size
+        except Exception:
+            return (0, 0)
+    
+    def _process_image_sync(self, image_data: bytes) -> str:
+        """Process an image synchronously for OCR"""
+        try:
+            image = Image.open(io.BytesIO(image_data))
+            text = pytesseract.image_to_string(image)
             return text.strip()
         except Exception as e:
             logger.error(f"OCR error: {e}")
             return ""
     
     def _generate_key_points(self, text: str) -> List[str]:
-        """Generate key points from text"""
-        if not text:
+        """Generate key points from text - optimized for speed"""
+        if not text or len(text) < self.min_content_length:
             return []
         
         # Simple extraction of sentences ending with periods
-        sentences = re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', text)
+        sentences = re.findall(r'[^.!?]+[.!?]', text)
         
         # Filter sentences by length and content
         good_sentences = []
-        for sentence in sentences:
+        for sentence in sentences[:30]:  # Only process first 30 sentences
             sentence = sentence.strip()
             # Only include non-trivial sentences
             if len(sentence) > 20 and len(sentence.split()) > 5:
                 good_sentences.append(sentence)
         
         # Select up to 5 key sentences
-        step = max(1, len(good_sentences) // 5)
-        key_points = good_sentences[::step][:5]
+        if len(good_sentences) <= 5:
+            return good_sentences
         
-        return key_points
+        # Pick 5 well-distributed sentences
+        step = len(good_sentences) // 5
+        return [good_sentences[i * step] for i in range(5)]
     
     def _summarize_json(self, json_data: Any) -> List[str]:
-        """Extract key points from JSON data"""
+        """Extract key points from JSON data - simplified for speed"""
         points = []
         
         if isinstance(json_data, dict):
-            # For objects, include top-level keys and some values
+            # For objects, include top-level keys and some values (limit to 5)
             for key, value in list(json_data.items())[:5]:
                 if isinstance(value, (str, int, float, bool)):
                     points.append(f"{key}: {value}")
@@ -346,7 +482,7 @@ class WebExtractor:
             if json_data and len(json_data) > 0:
                 sample = json_data[0]
                 if isinstance(sample, dict):
-                    keys = ", ".join(list(sample.keys())[:5])
+                    keys = ", ".join(list(sample.keys())[:3])  # Limit to 3 keys
                     points.append(f"Each item contains keys: {keys}...")
                 else:
                     points.append(f"Items are of type: {type(sample).__name__}")
@@ -367,7 +503,12 @@ class WebExtractor:
     async def extract_from_image(self, image_data: bytes) -> Dict[str, Any]:
         """Extract text from a single image"""
         try:
-            text = await self._extract_text_from_image(image_data)
+            # Process in thread pool
+            loop = asyncio.get_event_loop()
+            text = await loop.run_in_executor(
+                self.thread_pool,
+                lambda: self._process_image_sync(image_data)
+            )
             
             return {
                 "success": True,

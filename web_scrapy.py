@@ -1,11 +1,13 @@
 import httpx
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 import logging
 import random
 import time
+import cachetools
+import concurrent.futures
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -16,16 +18,22 @@ class WebScraper:
         self, 
         max_results: int = 5, 
         search_depth: int = 2, 
-        timeout: int = 30,
+        timeout: int = 15,
         exclude_domains: List[str] = None,
         user_agents: List[str] = None,
-        min_content_length: int = 100  # Minimum content length to consider valid
+        min_content_length: int = 100,  # Minimum content length to consider valid
+        connection_pool_size: int = 20,  # Connection pool size for HTTP requests
+        cache_size: int = 100  # Cache size for results
     ):
         self.max_results = max_results
         self.search_depth = search_depth
         self.timeout = timeout
         self.exclude_domains = exclude_domains or []
         self.min_content_length = min_content_length
+        self.connection_pool_size = connection_pool_size
+        
+        # Set up a cache for results to avoid redundant requests
+        self.cache = cachetools.LRUCache(maxsize=cache_size)
         
         # Default user agents list for rotating to avoid detection
         self.user_agents = user_agents or [
@@ -62,265 +70,320 @@ class WebScraper:
                 "snippet_selector": "a.result__snippet"
             }
         ]
+        
+        # Flag to track search task completion
+        self.search_complete = asyncio.Event()
     
     async def search(self, query: str) -> List[Dict[str, Any]]:
         """Execute a search across multiple search engines and aggregate results"""
         logger.info(f"Searching for: {query}")
-        all_results = []
-        tasks = []
+        start_time = time.time()
         
-        # Create a client session with limits
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            # Search across all engines
+        # Check cache first
+        cache_key = f"search:{query}:{self.max_results}"
+        if cache_key in self.cache:
+            logger.info(f"Cache hit for query: {query}")
+            return self.cache[cache_key]
+        
+        # Create shared data structures for collecting results
+        all_results = []
+        unique_urls = set()
+        
+        # Semaphore to limit concurrent connections
+        semaphore = asyncio.Semaphore(self.connection_pool_size)
+        
+        # Function to get a random user agent
+        def get_random_user_agent():
+            return random.choice(self.user_agents)
+        
+        # Create an HTTP client to be shared across all requests
+        limits = httpx.Limits(max_connections=self.connection_pool_size)
+        async with httpx.AsyncClient(
+            timeout=self.timeout, 
+            follow_redirects=True,
+            limits=limits
+        ) as client:
+            # Search engines in parallel
+            engine_tasks = []
             for engine in self.search_engines:
-                tasks.append(self._search_engine(client, query, engine))
+                engine_tasks.append(
+                    self._search_engine(client, query, engine, semaphore, get_random_user_agent)
+                )
             
-            engine_results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Run all search engine tasks concurrently
+            engine_results = await asyncio.gather(*engine_tasks, return_exceptions=True)
             
-            # Combine and deduplicate results
+            # Process results
             for results in engine_results:
                 if isinstance(results, Exception):
                     logger.error(f"Search engine error: {results}")
                     continue
                 
-                all_results.extend(results)
+                # Add unique results to the collection
+                for result in results:
+                    url = result.get("url", "")
+                    if url and url not in unique_urls:
+                        unique_urls.add(url)
+                        all_results.append(result)
             
-            # Remove duplicates based on URL
-            unique_results = self._deduplicate_results(all_results)
+            # Efficient sorting and limiting
+            all_results = sorted(all_results, key=lambda x: len(x.get("snippet", "")), reverse=True)
+            desired_count = min(self.max_results * 2, len(all_results))
+            limited_results = all_results[:desired_count]
             
-            # Limit results to max_results or request more if search_depth > 1
-            desired_count = self.max_results * (2 if self.search_depth > 1 else 1)
-            limited_results = unique_results[:desired_count]
-            
-            # If search depth > 1, follow links and extract additional information
-            if self.search_depth > 1:
-                limited_results = await self._enrich_results(client, limited_results)
+            # If search depth > 1, enrich results in parallel
+            if self.search_depth > 1 and limited_results:
+                # Create enrichment tasks for all results
+                enrich_tasks = []
+                for result in limited_results:
+                    enrich_tasks.append(
+                        self._fetch_page_content(client, result, semaphore, get_random_user_agent)
+                    )
                 
-                # Filter results to ensure they have valid content
-                valid_results = self._filter_valid_results(limited_results)
+                # Run all enrichment tasks concurrently with a timeout
+                enriched_results = await asyncio.gather(*enrich_tasks, return_exceptions=True)
                 
-                # If we have fewer valid results than max_results, try to get more
-                if len(valid_results) < self.max_results and len(limited_results) < len(unique_results):
-                    additional_results = unique_results[len(limited_results):len(limited_results) + (self.max_results - len(valid_results))]
+                # Filter valid results
+                valid_results = []
+                for res in enriched_results:
+                    if isinstance(res, Exception):
+                        logger.error(f"Enrichment error: {res}")
+                        continue
+                    if res.get("has_content", False):
+                        valid_results.append(res)
+                
+                # If we don't have enough valid results, try more from the remaining candidates
+                if len(valid_results) < self.max_results and len(all_results) > desired_count:
+                    additional_candidates = all_results[desired_count:desired_count + (self.max_results - len(valid_results))]
                     
-                    if additional_results:
-                        enriched_additional = await self._enrich_results(client, additional_results)
-                        valid_additional = self._filter_valid_results(enriched_additional)
-                        valid_results.extend(valid_additional)
+                    if additional_candidates:
+                        # Create tasks for additional candidates
+                        add_tasks = []
+                        for result in additional_candidates:
+                            add_tasks.append(
+                                self._fetch_page_content(client, result, semaphore, get_random_user_agent)
+                            )
+                        
+                        # Process additional candidates
+                        add_results = await asyncio.gather(*add_tasks, return_exceptions=True)
+                        
+                        # Add valid results
+                        for res in add_results:
+                            if isinstance(res, Exception):
+                                continue
+                            if res.get("has_content", False):
+                                valid_results.append(res)
                 
-                return valid_results[:self.max_results]
+                # Get the final results
+                final_results = valid_results[:self.max_results]
+                
+                # Cache the results
+                self.cache[cache_key] = final_results
+                
+                logger.info(f"Search completed in {time.time() - start_time:.2f}s with {len(final_results)} valid results")
+                return final_results
             
+            # If search depth is 1, just return the limited results
+            logger.info(f"Basic search completed in {time.time() - start_time:.2f}s with {len(limited_results)} results")
+            self.cache[cache_key] = limited_results[:self.max_results]
             return limited_results[:self.max_results]
     
-    def _filter_valid_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Filter results to only include those with valid content"""
-        valid_results = []
-        
-        for result in results:
-            # Check if the result has non-empty main content
-            main_content = result.get("main_content", "")
+    async def _search_engine(
+        self, 
+        client: httpx.AsyncClient, 
+        query: str, 
+        engine: Dict[str, str],
+        semaphore: asyncio.Semaphore,
+        get_user_agent: callable
+    ) -> List[Dict[str, Any]]:
+        """Execute a search on a specific search engine with resource limiting"""
+        async with semaphore:
+            results = []
             
-            if main_content and len(main_content.strip()) >= self.min_content_length:
-                valid_results.append(result)
-        
-        return valid_results
+            try:
+                # Format the search URL - request more results than needed
+                search_url = engine["url"].format(query=query, num=self.max_results * 3)
+                
+                # Use random user agent
+                headers = {"User-Agent": get_user_agent()}
+                
+                # Execute the search request with timeout
+                response = await client.get(search_url, headers=headers)
+                response.raise_for_status()
+                
+                # Fast HTML parsing with features limited to what we need
+                soup = BeautifulSoup(response.text, "html.parser")
+                
+                # Extract results
+                result_elements = soup.select(engine["result_selector"])
+                
+                # Process in batch for efficiency
+                for element in result_elements[:self.max_results * 3]:  # Limit processing to avoid excessive work
+                    try:
+                        # Extract title
+                        title_elem = element.select_one(engine["title_selector"])
+                        title = title_elem.get_text(strip=True) if title_elem else ""
+                        
+                        # Extract URL
+                        url_elem = element.select_one(engine["url_selector"])
+                        url = url_elem.get("href") if url_elem else ""
+                        
+                        # Clean URL (some engines add tracking parameters or use relative URLs)
+                        if url.startswith("/url?q="):
+                            url = url.split("/url?q=")[1].split("&")[0]
+                        
+                        # Ensure absolute URL
+                        if not url.startswith(("http://", "https://")):
+                            base_url = "/".join(search_url.split("/")[:3])
+                            url = urljoin(base_url, url)
+                        
+                        # Check if domain is excluded
+                        domain = urlparse(url).netloc
+                        if any(excluded in domain for excluded in self.exclude_domains):
+                            continue
+                        
+                        # Extract snippet
+                        snippet_elem = element.select_one(engine["snippet_selector"])
+                        snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+                        
+                        # Only add results with non-empty title and URL
+                        if title and url:
+                            # Add to results
+                            results.append({
+                                "title": title,
+                                "url": url,
+                                "snippet": snippet,
+                                "source": engine["name"]
+                            })
+                        
+                    except Exception as e:
+                        logger.error(f"Error parsing search result: {e}")
+                
+                # Add a small delay to avoid rate limiting (smaller delay)
+                await asyncio.sleep(random.uniform(0.2, 0.5))
+                
+                return results
+            
+            except Exception as e:
+                logger.error(f"Error searching {engine['name']}: {str(e)}")
+                return []
     
-    async def _search_engine(self, client: httpx.AsyncClient, query: str, engine: Dict[str, str]) -> List[Dict[str, Any]]:
-        """Execute a search on a specific search engine"""
-        results = []
-        
-        try:
-            # Format the search URL - request more results than needed
-            search_url = engine["url"].format(query=query, num=self.max_results * 3)
-            
-            # Use random user agent
-            headers = {"User-Agent": random.choice(self.user_agents)}
-            
-            # Execute the search request
-            response = await client.get(search_url, headers=headers)
-            response.raise_for_status()
-            
-            # Parse the HTML
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            # Extract results
-            result_elements = soup.select(engine["result_selector"])
-            
-            for element in result_elements:
-                try:
-                    # Extract title
-                    title_elem = element.select_one(engine["title_selector"])
-                    title = title_elem.get_text(strip=True) if title_elem else ""
-                    
-                    # Extract URL
-                    url_elem = element.select_one(engine["url_selector"])
-                    url = url_elem.get("href") if url_elem else ""
-                    
-                    # Clean URL (some engines add tracking parameters or use relative URLs)
-                    if url.startswith("/url?q="):
-                        url = url.split("/url?q=")[1].split("&")[0]
-                    
-                    # Ensure absolute URL
-                    if not url.startswith(("http://", "https://")):
-                        base_url = "/".join(search_url.split("/")[:3])
-                        url = urljoin(base_url, url)
-                    
-                    # Check if domain is excluded
-                    domain = urlparse(url).netloc
-                    if any(excluded in domain for excluded in self.exclude_domains):
-                        continue
-                    
-                    # Extract snippet
-                    snippet_elem = element.select_one(engine["snippet_selector"])
-                    snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
-                    
-                    # Only add results with non-empty title and URL
-                    if title and url:
-                        # Add to results
-                        results.append({
-                            "title": title,
-                            "url": url,
-                            "snippet": snippet,
-                            "source": engine["name"]
-                        })
-                    
-                except Exception as e:
-                    logger.error(f"Error parsing search result: {e}")
-            
-            # Add a small delay to avoid rate limiting
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            
-            return results
-        
-        except Exception as e:
-            logger.error(f"Error searching {engine['name']}: {str(e)}")
-            return []
-    
-    def _deduplicate_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove duplicate results based on URL"""
-        unique_urls = set()
-        unique_results = []
-        
-        for result in results:
+    async def _fetch_page_content(
+        self, 
+        client: httpx.AsyncClient, 
+        result: Dict[str, Any],
+        semaphore: asyncio.Semaphore,
+        get_user_agent: callable
+    ) -> Dict[str, Any]:
+        """Fetch the content of a page with resource limiting and optimized parsing"""
+        async with semaphore:
             url = result.get("url", "")
-            if url and url not in unique_urls:
-                unique_urls.add(url)
-                unique_results.append(result)
-        
-        return unique_results
+            
+            if not url:
+                result["has_content"] = False
+                return result
+            
+            # Check cache first
+            cache_key = f"content:{url}"
+            if cache_key in self.cache:
+                return self.cache[cache_key]
+            
+            try:
+                # Use random user agent
+                headers = {"User-Agent": get_user_agent()}
+                
+                # Fetch the page with timeout
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                
+                # Check content type - only process HTML
+                content_type = response.headers.get("content-type", "")
+                if "text/html" not in content_type:
+                    result["has_content"] = False
+                    return result
+                
+                # Parse the HTML with minimal features for speed
+                soup = BeautifulSoup(response.text, "html.parser")
+                
+                # Extract metadata quickly
+                meta_tags = {}
+                for meta in soup.find_all("meta", limit=10):  # Limit to 10 most important meta tags
+                    name = meta.get("name") or meta.get("property")
+                    content = meta.get("content")
+                    if name and content:
+                        meta_tags[name] = content
+                
+                # Extract main content efficiently
+                main_content = self._extract_content_fast(soup)
+                
+                # Determine if content is valid
+                has_content = bool(main_content and len(main_content.strip()) >= self.min_content_length)
+                
+                # Update the result with additional information
+                result.update({
+                    "meta_tags": meta_tags,
+                    "main_content": main_content,
+                    "has_content": has_content,
+                    "last_updated": time.time()
+                })
+                
+                # Cache the result
+                self.cache[cache_key] = result
+                
+                return result
+            
+            except Exception as e:
+                logger.error(f"Error fetching page content for {url}: {str(e)}")
+                # Mark this result as having no content
+                result.update({
+                    "error": str(e),
+                    "has_content": False,
+                    "main_content": ""
+                })
+                return result
     
-    async def _enrich_results(self, client: httpx.AsyncClient, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Follow links and extract additional information"""
-        tasks = []
+    def _extract_content_fast(self, soup: BeautifulSoup) -> str:
+        """Extract the main content from HTML using a fast approach"""
+        # Remove script and style elements to clean up the content
+        for script in soup(["script", "style", "nav", "footer", "header", "aside"], limit=50):
+            script.decompose()
         
-        for result in results:
-            tasks.append(self._fetch_page_content(client, result))
+        # Try to find main content in common containers - check only a few most common ones
+        content_selectors = [
+            "article", "main", ".content", "#content", ".post", ".article"
+        ]
         
-        enriched_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for selector in content_selectors:
+            content_elem = soup.select_one(selector)
+            if content_elem:
+                return content_elem.get_text(separator=" ", strip=True)[:5000]
         
-        # Filter out exceptions and keep track of the results
-        final_results = []
-        for i, r in enumerate(enriched_results):
-            if isinstance(r, Exception):
-                logger.error(f"Error enriching result: {r}")
-            else:
-                # Include the result only if it has content
-                if r.get("main_content", ""):
-                    final_results.append(r)
-                else:
-                    logger.info(f"Skipping result without content: {r.get('url', 'unknown URL')}")
+        # If no content found, look for the div with the most text
+        divs = soup.find_all("div", limit=30)  # Limit to top 30 divs to avoid excessive processing
+        best_div = None
+        most_text = 0
         
-        return final_results
+        for div in divs:
+            text = div.get_text(strip=True)
+            if len(text) > most_text:
+                most_text = len(text)
+                best_div = div
+        
+        if best_div and most_text >= self.min_content_length:
+            return best_div.get_text(separator=" ", strip=True)[:5000]
+        
+        # If still no content, get all paragraph text
+        paragraphs = soup.find_all("p", limit=20)
+        if paragraphs:
+            text = " ".join(p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20)
+            return text[:5000]
+        
+        # Last resort: get body text
+        if soup.body:
+            return soup.body.get_text(separator=" ", strip=True)[:5000]
+        
+        return ""
     
-    async def _fetch_page_content(self, client: httpx.AsyncClient, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Fetch the content of a page and extract more information"""
-        url = result.get("url", "")
-        
-        if not url:
-            return result
-        
-        try:
-            # Use random user agent
-            headers = {"User-Agent": random.choice(self.user_agents)}
-            
-            # Fetch the page
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            
-            # Parse the HTML
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            # Extract metadata
-            meta_tags = {}
-            for meta in soup.find_all("meta"):
-                name = meta.get("name") or meta.get("property")
-                content = meta.get("content")
-                if name and content:
-                    meta_tags[name] = content
-            
-            # Extract main content
-            main_content = ""
-            
-            # Try to find main content in common containers
-            content_selectors = [
-                "article", "main", ".content", "#content", ".post", ".article", 
-                ".entry-content", "#main-content"
-            ]
-            
-            for selector in content_selectors:
-                content_elem = soup.select_one(selector)
-                if content_elem:
-                    # Get the text but limit to 5000 characters
-                    main_content = content_elem.get_text(separator=" ", strip=True)[:5000]
-                    break
-            
-            # If no content found, use the body text
-            if not main_content and soup.body:
-                main_content = soup.body.get_text(separator=" ", strip=True)[:5000]
-            
-            # Get internal links for potential further crawling
-            internal_links = []
-            domain = urlparse(url).netloc
-            
-            for a in soup.find_all("a", href=True):
-                link_url = a.get("href")
-                if link_url:
-                    # Make URL absolute
-                    if not link_url.startswith(("http://", "https://")):
-                        link_url = urljoin(url, link_url)
-                    
-                    # Check if it's an internal link
-                    link_domain = urlparse(link_url).netloc
-                    if link_domain == domain:
-                        internal_links.append({
-                            "url": link_url,
-                            "text": a.get_text(strip=True)
-                        })
-            
-            # Update the result with additional information
-            result.update({
-                "meta_tags": meta_tags,
-                "main_content": main_content,
-                "internal_links": internal_links[:10],  # Limit to 10 internal links
-                "last_updated": time.time(),
-                "has_content": bool(main_content and len(main_content.strip()) >= self.min_content_length)
-            })
-            
-            # Add a small delay to avoid rate limiting
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-            
-            return result
-        
-        except Exception as e:
-            logger.error(f"Error fetching page content for {url}: {str(e)}")
-            # Mark this result as having no content
-            result.update({
-                "error": str(e),
-                "has_content": False,
-                "main_content": ""
-            })
-            return result
-
     async def search_by_domain(self, query: str, domain: str) -> List[Dict[str, Any]]:
         """Search for information within a specific domain"""
         site_query = f"{query} site:{domain}"
